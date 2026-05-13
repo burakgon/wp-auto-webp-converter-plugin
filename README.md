@@ -1,11 +1,11 @@
-# MMR WebP Converter
+# WP Auto WebP Converter
 
 **A WordPress plugin that turns the images in your posts into WebP automatically the moment you hit Save.**
 
-[![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)](https://wordpress.org/)
+[![WordPress plugin](https://img.shields.io/badge/WordPress-plugin-21759b?logo=wordpress&logoColor=white)](https://wordpress.org/)
+[![WordPress version](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)](https://wordpress.org/)
 [![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)](https://www.php.net/)
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
-[![Plugin type](https://img.shields.io/badge/type-WordPress%20plugin-21759b)](#)
 
 No setup. No background queue to babysit. No client-side JavaScript. Just install, activate, and every post you save afterwards ships with `.webp` images in the HTML — while the originals stay on disk untouched as a fallback.
 
@@ -34,23 +34,23 @@ Originals are never deleted. External URLs and non-raster files (SVG, JS, etc.) 
 ## What it does **not** do
 
 - Does not optimize images outside post content (featured image storage, media library bulk processing).
-- Does not generate AVIF (the server has the libraries; just a config flag away if you want to fork).
+- Does not generate AVIF (the underlying libraries support it; a small fork away if you want it).
 - Does not handle responsive image variants WordPress generates internally — only the URLs that actually end up in your post HTML.
-- Does not purge your CDN. If you sit behind Cloudflare / Bunny / Fastly, your edge cache will keep serving the old HTML until it expires. Wire your own purge into the `mmr_webp_post_types` flow if you need instant invalidation.
+- Does not purge your CDN. If you sit behind Cloudflare / Bunny / Fastly, your edge cache will keep serving the old HTML until it expires. Wire your own purge into the `wp_auto_webp_post_types` flow if you need instant invalidation.
 
 ## Installation
 
 ### Via WP-CLI
 
 ```bash
-wp plugin install https://github.com/burakgon/mmr-webp-converter/archive/refs/heads/main.zip --activate
+wp plugin install https://github.com/burakgon/wp-auto-webp-converter-plugin/archive/refs/heads/main.zip --activate
 ```
 
 ### Manual
 
 1. Download or clone this repository.
-2. Copy the `mmr-webp-converter` directory into `wp-content/plugins/`.
-3. Activate **MMR WebP Converter** from the WordPress **Plugins** screen.
+2. Copy the `wp-auto-webp-converter-plugin` directory into `wp-content/plugins/`.
+3. Activate **WP Auto WebP Converter** from the WordPress **Plugins** screen.
 
 ### Requirements
 
@@ -60,7 +60,7 @@ wp plugin install https://github.com/burakgon/mmr-webp-converter/archive/refs/he
   - PHP **Imagick** extension built with WebP support (recommended), or
   - PHP **GD** extension built with WebP support (`gd_info()['WebP Support']` should be true).
 
-Most modern hosts ship both. If you are unsure, save a post with an image and check the post meta `_mmr_webp_stats` — `converted > 0` confirms the encoder is wired up.
+Most modern hosts ship both. If you are unsure, save a post with an image and check the post meta `_wp_auto_webp_stats` — `converted > 0` confirms the encoder is wired up.
 
 ## Usage
 
@@ -92,13 +92,13 @@ After activating, you almost certainly want to run the conversion on everything 
 
 ```bash
 # Convert a single post
-wp mmr-webp run --post=1234
+wp auto-webp run --post=1234
 
 # Convert several posts
-wp mmr-webp run --post=1234,5678,9012
+wp auto-webp run --post=1234,5678,9012
 
-# Convert every post matching mmr_webp_post_types (default: 'post')
-wp mmr-webp run --all
+# Convert every post matching wp_auto_webp_post_types (default: 'post')
+wp auto-webp run --all
 ```
 
 The CLI command prints per-post counts and a final summary:
@@ -116,7 +116,7 @@ Success: Done. posts_changed=12 converted=47 failed=0 skipped=8
 ### Process additional post types
 
 ```php
-add_filter( 'mmr_webp_post_types', function ( $types ) {
+add_filter( 'wp_auto_webp_post_types', function ( $types ) {
     $types[] = 'page';
     $types[] = 'product';
     return $types;
@@ -129,18 +129,18 @@ Two post-meta keys are written every time the hook runs (whether or not content 
 
 | Meta key | Value |
 |---|---|
-| `_mmr_webp_last_run` | Unix timestamp of the most recent run |
-| `_mmr_webp_stats` | `['converted' => N, 'failed' => N, 'skipped_external' => N]` |
+| `_wp_auto_webp_last_run` | Unix timestamp of the most recent run |
+| `_wp_auto_webp_stats` | `['converted' => N, 'failed' => N, 'skipped_external' => N]` |
 
 ```php
-$stats = get_post_meta( $post_id, '_mmr_webp_stats', true );
+$stats = get_post_meta( $post_id, '_wp_auto_webp_stats', true );
 ```
 
 ## How it works (under the hood)
 
 - **Hook:** `save_post_post` at priority 20. Autosaves, revisions, `auto-draft`, `trash`, and `inherit` statuses are rejected up front so the heavy work never runs for noise saves.
 - **Encoder:** `wp_get_image_editor( $path )` — Imagick is picked first; GD is the fallback. Both are saved with `image/webp` MIME and a quality of 82, which empirically gives near-visually-lossless output at roughly 30–80% file size savings vs JPG/PNG.
-- **Idempotency:** Before re-encoding, the plugin checks `filemtime( webp ) >= filemtime( source )`. If a fresher `.webp` already exists (e.g., from a previous plugin like Imagify), it is reused — no wasted CPU.
+- **Idempotency:** Before re-encoding, the plugin checks `filemtime( webp ) >= filemtime( source )`. If a fresher `.webp` already exists (e.g., from a previous plugin), it is reused — no wasted CPU.
 - **DB writes:** Content updates go through `$wpdb->update` directly, not `wp_update_post`. This is deliberate: we only rewrite URL substrings inside attributes we found, never inject new HTML, so we skip `wp_kses` re-sanitization and we don't re-enter the `save_post` action.
 - **Block editor compatibility:** Gutenberg stores image URLs both in the inner `<img src>` *and* in the block-comment JSON header (`<!-- wp:image {"url":"…"} -->`). Both are rewritten in lockstep, so the editor will not flag a "block recovery" mismatch on reopen.
 
@@ -153,24 +153,24 @@ It only changes attribute *values*, never tag structure. If your lightbox plugin
 No. They remain on disk so any external link, RSS reader, OG image consumer, or old cache that still references them gets a 200, not a 404.
 
 **Will my old posts get converted?**
-Not until you re-save them, or run `wp mmr-webp run --all` once.
+Not until you re-save them, or run `wp auto-webp run --all` once.
 
 **Why not use a `<picture>` element with `<source type="image/webp">`?**
 You can, and it's a fine approach. But rewriting `src` directly is simpler, plays better with downstream consumers (RSS, OG tags, AMP), and works with every theme/block out of the box. WebP browser support is universal as of 2024 — the fallback path is rarely exercised in practice.
 
-**What happens if the same source has both a `.webp` from me and one from another plugin (e.g., Imagify)?**
+**What happens if the same source has both a `.webp` from me and one from another plugin?**
 The newest one wins per `filemtime` check — usually that's whichever plugin ran most recently. There is only ever one `.webp` per source.
 
 **Can I change the quality?**
-Open `mmr-webp-converter.php` and tweak the `QUALITY` constant. It's the only knob right now and intentionally so.
+Open `wp-auto-webp-converter-plugin.php` and tweak the `QUALITY` constant. It's the only knob right now and intentionally so.
 
 ## Changelog
 
 ### 1.0.0
 - Initial release.
 - Rewrites `src`, `srcset`, `data-src`, `data-lazy-src`, `data-srcset`, and block-comment JSON `"url"` metadata.
-- WP-CLI: `wp mmr-webp run --post=ID[,ID]` and `wp mmr-webp run --all`.
-- Filters: `mmr_webp_post_types`.
+- WP-CLI: `wp auto-webp run --post=ID[,ID]` and `wp auto-webp run --all`.
+- Filters: `wp_auto_webp_post_types`.
 
 ## License
 

@@ -1,16 +1,18 @@
 <?php
 /**
- * Plugin Name: MMR WebP Converter
- * Plugin URI: https://www.mobilemarketingreads.com/
+ * Plugin Name: WP Auto WebP Converter
+ * Plugin URI: https://github.com/burakgon/wp-auto-webp-converter-plugin
  * Description: On every post save, scans the post content for &lt;img&gt; references to JPG/PNG/GIF files under /wp-content/uploads, generates a sibling .webp via WP_Image_Editor (Imagick preferred, GD fallback), and rewrites src / srcset / data-src / data-lazy-src / data-srcset attributes to point at the .webp version. Originals stay on disk as fallback. Idempotent: a second save is a no-op when every URL is already .webp or already converted.
  * Version: 1.0.0
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Author: burakgon
+ * Author URI: https://github.com/burakgon
  * License: GPL-2.0-or-later
+ * Text Domain: wp-auto-webp-converter-plugin
  */
 
-namespace MMR\WebP;
+namespace WPAutoWebP;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -18,16 +20,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 const VERSION    = '1.0.0';
 const QUALITY    = 82;
-const META_RUN   = '_mmr_webp_last_run';
-const META_STATS = '_mmr_webp_stats';
-const LOG_PREFIX = '[mmr-webp] ';
+const META_RUN   = '_wp_auto_webp_last_run';
+const META_STATS = '_wp_auto_webp_stats';
+const LOG_PREFIX = '[wp-auto-webp] ';
 const HOOK_PRIO  = 20;
 
 /**
- * Default post types we touch. Override with the mmr_webp_post_types filter.
+ * Default post types we touch. Override with the wp_auto_webp_post_types filter.
  */
 function default_post_types(): array {
-	return apply_filters( 'mmr_webp_post_types', array( 'post' ) );
+	return apply_filters( 'wp_auto_webp_post_types', array( 'post' ) );
 }
 
 function should_process( int $post_id, \WP_Post $post ): bool {
@@ -231,11 +233,11 @@ function on_save( int $post_id, \WP_Post $post ): void {
 add_action( 'save_post_post', __NAMESPACE__ . '\on_save', HOOK_PRIO, 2 );
 
 /**
- * WP-CLI: `wp mmr-webp run --post=ID` (or --all) to (re)process posts on demand.
+ * WP-CLI: `wp auto-webp run --post=ID` (or --all) to (re)process posts on demand.
  */
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	\WP_CLI::add_command(
-		'mmr-webp run',
+		'auto-webp run',
 		function ( $args, $assoc ) {
 			$ids = array();
 			if ( ! empty( $assoc['post'] ) ) {
@@ -329,7 +331,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 					'name'        => 'all',
 					'type'        => 'flag',
 					'optional'    => true,
-					'description' => 'Process every post matching mmr_webp_post_types.',
+					'description' => 'Process every post matching wp_auto_webp_post_types.',
 				),
 			),
 		)
