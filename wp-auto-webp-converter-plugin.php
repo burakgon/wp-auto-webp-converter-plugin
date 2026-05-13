@@ -404,28 +404,39 @@ function rewrite_html_output( $html ) {
 	}
 
 	list( $base_url, $base_dir ) = uploads_base();
-	$host_path  = ltrim( strip_scheme( $base_url ), '/' ); // host + path, no scheme, no leading //
-	$host_quoted = preg_quote( $host_path, '/' );
+	$host_path = ltrim( strip_scheme( $base_url ), '/' ); // host + path, no scheme, no leading //
 
 	// Match upload-base URLs to JPG/PNG/GIF, allowing four common slash encodings:
 	//   plain /        — typical HTML attributes
 	//   escaped \/     — JSON / JSON-LD blocks
 	//   entity &#47;   — over-cautious HTML escapers
 	//   unicode / — JSON encoders that escape forward slash to unicode
-	$slash = '(?:\\\\\/|\\\\u002F|&#47;|\/)';
-	$pattern = '#(?:https?:)?' . $slash . $slash . $host_quoted . $slash . '[^\s"\'<>()]+?\.(?:jpe?g|png|gif)(?=["\'\s<>?#)\\\\]|$)#i';
+	// Delimiter is `~` because the pattern contains `#` (in &#47;) and `?` (in the
+	// query lookahead); `#` or `/` as the delimiter would terminate the regex early.
+	$slash = '(?:\\\\\/|\\\\u002F|&#47;|/)';
 
-	return preg_replace_callback(
+	// Build a host-path matcher that accepts any slash encoding between segments,
+	// not only the `/` we pulled out of get_upload_dir(). Without this, JSON-LD
+	// URLs like "https:\/\/example.com\/wp-content\/uploads\/..." never match.
+	$host_segments = array_map(
+		function ( $part ) {
+			return preg_quote( $part, '~' );
+		},
+		explode( '/', $host_path )
+	);
+	$host_pattern = implode( $slash, $host_segments );
+
+	$pattern = '~(?:https?:)?' . $slash . $slash . $host_pattern . $slash . '[^\s"\'<>()]+?\.(?:jpe?g|png|gif)(?=["\'\s<>?#)\\\\]|$)~i';
+
+	$out = preg_replace_callback(
 		$pattern,
 		function ( $m ) {
 			$url = $m[0];
-			// Normalize every slash variant to plain `/` so file lookup works.
 			$normalized = str_replace( array( '\\/', '\\u002F', '&#47;' ), '/', $url );
 			$new        = maybe_swap_to_webp_url( $normalized );
 			if ( $new === $normalized ) {
 				return $url;
 			}
-			// Re-encode the slashes the same way the original URL had them.
 			if ( false !== strpos( $url, '\\u002F' ) ) {
 				return str_replace( '/', '\\u002F', $new );
 			}
@@ -439,6 +450,10 @@ function rewrite_html_output( $html ) {
 		},
 		$html
 	);
+
+	// preg_replace_callback returns null on regex error. Returning null from an
+	// ob_start callback blanks the page, so always fall back to the original HTML.
+	return ( null === $out ) ? $html : $out;
 }
 
 add_filter(
