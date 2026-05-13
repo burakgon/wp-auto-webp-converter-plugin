@@ -23,19 +23,19 @@ That way every downstream consumer — Cloudflare, your CDN, AMP, RSS aggregator
 
 On every `save_post_post` (manual draft save, publish, scheduled, REST API, classic editor, block editor — anything that fires the hook), the plugin will:
 
-1. Read the saved post content.
-2. Find every `<img>`-style URL pointing to a JPG / PNG / GIF inside `/wp-content/uploads`.
-3. For each one, generate a sibling `.webp` next to the original (via `WP_Image_Editor`; Imagick preferred, GD fallback), quality 82.
-4. Rewrite `src`, `srcset`, `data-src`, `data-lazy-src`, and `data-srcset` attributes — plus Gutenberg block-comment `"url":"…"` metadata — to point at the `.webp` twin.
-5. Write the updated HTML straight back to the `wp_posts` table.
+1. Read the saved post content and find every `<img>`-style URL pointing to a JPG / PNG / GIF inside `/wp-content/uploads`.
+2. Generate a sibling `.webp` next to each original (via `WP_Image_Editor`; Imagick preferred, GD fallback), quality 82.
+3. Rewrite `src`, `srcset`, `data-src`, `data-lazy-src`, and `data-srcset` attributes — plus Gutenberg block-comment `"url":"…"` metadata — to point at the `.webp` twin.
+4. Write the updated HTML straight back to the `wp_posts` table.
+5. Generate `.webp` sidecars for the **featured image** attachment original and every WP-generated thumbnail size.
+6. At render time, transparently swap featured image, gallery, REST API, schema.org, and Open Graph URLs to their `.webp` versions via the `wp_get_attachment_image_src` and `wp_calculate_image_srcset` filters whenever a sidecar is present on disk.
 
 Originals are never deleted. External URLs and non-raster files (SVG, JS, etc.) are skipped. Already-converted posts are a no-op on resave.
 
 ## What it does **not** do
 
-- Does not optimize images outside post content (featured image storage, media library bulk processing).
 - Does not generate AVIF (the underlying libraries support it; a small fork away if you want it).
-- Does not handle responsive image variants WordPress generates internally — only the URLs that actually end up in your post HTML.
+- Does not bulk-process the entire media library — only files reached through post content or featured images.
 - Does not purge your CDN. If you sit behind Cloudflare / Bunny / Fastly, your edge cache will keep serving the old HTML until it expires. Wire your own purge into the `wp_auto_webp_post_types` flow if you need instant invalidation.
 
 ## Installation
@@ -165,6 +165,14 @@ The newest one wins per `filemtime` check — usually that's whichever plugin ra
 Open `wp-auto-webp-converter-plugin.php` and tweak the `QUALITY` constant. It's the only knob right now and intentionally so.
 
 ## Changelog
+
+### 1.1.0
+- **Featured image + everything-else coverage.** On save, `.webp` sidecars are generated for the featured image attachment and every WordPress-generated thumbnail size. At render time URLs are swapped to `.webp` via a stack of complementary filters:
+  - `wp_get_attachment_image_src`, `wp_calculate_image_srcset`, `wp_get_attachment_image_attributes`, `wp_get_attachment_url` — standard WP rendering paths.
+  - `aioseo_facebook_tags`, `aioseo_twitter_tags` — All in One SEO's cached og/twitter image URLs.
+  - A final-sweep output buffer on `template_redirect` rewrites any remaining raster URL under `/wp-content/uploads` in the rendered HTML head/body — including JSON-LD `<script type="application/ld+json">` blocks. Handles plain `/`, JSON-escaped `\/`, JSON-unicode `/`, and HTML-entity `&#47;` slash encodings, and re-encodes them the same way it found them so JSON-LD doesn't break.
+- Output buffer is skipped for admin, AJAX, REST, cron, and feed responses. Filter `wp_auto_webp_skip_output_buffer` available to disable it explicitly.
+- `wp auto-webp run --post|--all` now also generates featured image sidecars during backfill.
 
 ### 1.0.0
 - Initial release.

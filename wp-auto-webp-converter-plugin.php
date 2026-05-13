@@ -2,8 +2,8 @@
 /**
  * Plugin Name: WP Auto WebP Converter
  * Plugin URI: https://github.com/burakgon/wp-auto-webp-converter-plugin
- * Description: On every post save, scans the post content for &lt;img&gt; references to JPG/PNG/GIF files under /wp-content/uploads, generates a sibling .webp via WP_Image_Editor (Imagick preferred, GD fallback), and rewrites src / srcset / data-src / data-lazy-src / data-srcset attributes to point at the .webp version. Originals stay on disk as fallback. Idempotent: a second save is a no-op when every URL is already .webp or already converted.
- * Version: 1.0.0
+ * Description: On every post save, scans the post content for &lt;img&gt; references to JPG/PNG/GIF files under /wp-content/uploads, generates a sibling .webp via WP_Image_Editor (Imagick preferred, GD fallback), and rewrites src / srcset / data-src / data-lazy-src / data-srcset attributes to point at the .webp version. Featured images (and every WordPress-generated thumbnail size for them) are also converted and swapped to .webp at render time via the wp_get_attachment_image_src and wp_calculate_image_srcset filters — covering featured image displays, galleries, OG tags, schema.org, and REST API output. Originals stay on disk as fallback. Idempotent: a second save is a no-op when every URL is already .webp or already converted.
+ * Version: 1.1.0
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Author: burakgon
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const VERSION    = '1.0.0';
+const VERSION    = '1.1.0';
 const QUALITY    = 82;
 const META_RUN   = '_wp_auto_webp_last_run';
 const META_STATS = '_wp_auto_webp_stats';
@@ -196,6 +196,56 @@ function process_content( string $content, array &$stats ): string {
 	return $content;
 }
 
+/**
+ * Generate .webp sidecars for the featured image (and every WP-generated intermediate size).
+ * Featured images live outside post_content, so the post_content regex cannot reach them — we
+ * resolve them via the _thumbnail_id pointer and walk the attachment's metadata 'sizes' array.
+ */
+function ensure_featured_image_webp( int $post_id, array &$stats ): void {
+	$thumb_id = get_post_thumbnail_id( $post_id );
+	if ( ! $thumb_id ) {
+		return;
+	}
+
+	$original_path = get_attached_file( $thumb_id );
+	if ( ! $original_path || ! is_file( $original_path ) ) {
+		return;
+	}
+	if ( ! preg_match( '/\.(jpe?g|png|gif)$/i', $original_path ) ) {
+		return;
+	}
+
+	if ( ensure_webp( $original_path ) ) {
+		++$stats['converted'];
+	} else {
+		++$stats['failed'];
+	}
+
+	$meta = wp_get_attachment_metadata( $thumb_id );
+	if ( empty( $meta['sizes'] ) || ! is_array( $meta['sizes'] ) ) {
+		return;
+	}
+
+	$base_dir = dirname( $original_path );
+	foreach ( $meta['sizes'] as $size_data ) {
+		if ( empty( $size_data['file'] ) ) {
+			continue;
+		}
+		$size_path = $base_dir . '/' . $size_data['file'];
+		if ( ! is_file( $size_path ) ) {
+			continue;
+		}
+		if ( ! preg_match( '/\.(jpe?g|png|gif)$/i', $size_path ) ) {
+			continue;
+		}
+		if ( ensure_webp( $size_path ) ) {
+			++$stats['converted'];
+		} else {
+			++$stats['failed'];
+		}
+	}
+}
+
 function on_save( int $post_id, \WP_Post $post ): void {
 	if ( ! should_process( $post_id, $post ) ) {
 		return;
@@ -208,6 +258,8 @@ function on_save( int $post_id, \WP_Post $post ): void {
 		'skipped_external' => 0,
 	);
 	$updated = process_content( $original, $stats );
+
+	ensure_featured_image_webp( $post_id, $stats );
 
 	update_post_meta( $post_id, META_RUN, time() );
 	update_post_meta( $post_id, META_STATS, $stats );
@@ -231,6 +283,193 @@ function on_save( int $post_id, \WP_Post $post ): void {
 }
 
 add_action( 'save_post_post', __NAMESPACE__ . '\on_save', HOOK_PRIO, 2 );
+
+/**
+ * Swap an attachment URL to its .webp twin at render time if the sidecar exists on disk.
+ * Used by the wp_get_attachment_image_src and wp_calculate_image_srcset filters below to
+ * cover everything WP renders through standard attachment functions: featured images,
+ * galleries, blocks built via wp_get_attachment_image(), schema.org JSON-LD, OG tags,
+ * REST API responses, RSS enclosures, etc.
+ */
+function maybe_swap_to_webp_url( string $url ): string {
+	if ( ! preg_match( '/\.(jpe?g|png|gif)(\?|#|$)/i', $url ) ) {
+		return $url;
+	}
+	list( $base_url, $base_dir ) = uploads_base();
+	$path = url_to_local_path( $url, $base_url, $base_dir );
+	if ( null === $path ) {
+		return $url;
+	}
+	$webp_path = path_to_webp_path( $path );
+	if ( ! is_file( $webp_path ) ) {
+		return $url;
+	}
+	return url_to_webp_url( $url );
+}
+
+add_filter(
+	'wp_get_attachment_image_src',
+	function ( $image ) {
+		if ( ! is_array( $image ) || empty( $image[0] ) ) {
+			return $image;
+		}
+		$image[0] = maybe_swap_to_webp_url( (string) $image[0] );
+		return $image;
+	},
+	10,
+	1
+);
+
+add_filter(
+	'wp_calculate_image_srcset',
+	function ( $sources ) {
+		if ( ! is_array( $sources ) ) {
+			return $sources;
+		}
+		foreach ( $sources as $width => $source ) {
+			if ( empty( $source['url'] ) ) {
+				continue;
+			}
+			$sources[ $width ]['url'] = maybe_swap_to_webp_url( (string) $source['url'] );
+		}
+		return $sources;
+	},
+	10,
+	1
+);
+
+// Covers wp_get_attachment_url() callers — most commonly SEO/social plugins building
+// og:image / twitter:image / schema.org JSON-LD pointing at the original attachment.
+add_filter(
+	'wp_get_attachment_url',
+	function ( $url ) {
+		return is_string( $url ) ? maybe_swap_to_webp_url( $url ) : $url;
+	},
+	10,
+	1
+);
+
+// All in One SEO caches the og:image / twitter:image URL in its own wp_aioseo_posts table at
+// save time, then renders that string directly — the wp_get_attachment_url path is bypassed.
+// AIOSEO emits the tags as a flat assoc array of [meta_name => value]; we rewrite the values
+// for the image/url-bearing keys. No-op when AIOSEO is not installed.
+$aioseo_meta_rewriter = function ( $tags ) {
+	if ( ! is_array( $tags ) ) {
+		return $tags;
+	}
+	foreach ( $tags as $key => $value ) {
+		if ( ! is_string( $value ) || '' === $value ) {
+			continue;
+		}
+		if ( false === strpos( $value, '://' ) ) {
+			continue;
+		}
+		$tags[ $key ] = maybe_swap_to_webp_url( $value );
+	}
+	return $tags;
+};
+add_filter( 'aioseo_facebook_tags', $aioseo_meta_rewriter, 99 );
+add_filter( 'aioseo_twitter_tags', $aioseo_meta_rewriter, 99 );
+
+// Covers wp_get_attachment_image() consumers that build the final <img> attribute array
+// (src + srcset) themselves rather than going through wp_calculate_image_srcset.
+// Final-sweep output buffer. Some plugins (AIOSEO Pro caches og:image in wp_aioseo_posts,
+// social-button plugins, JSON-LD schema emitters) bypass every WP filter and write the URL
+// straight to the page. A regex pass on the final HTML catches all of them. Skipped for
+// admin, AJAX, REST, cron, and feed responses; only raster URLs under /wp-content/uploads
+// with an existing .webp sidecar are rewritten, so the worst-case outcome is "no change."
+function maybe_start_html_rewriter(): void {
+	if ( is_admin() || wp_doing_ajax() || wp_doing_cron() ) {
+		return;
+	}
+	if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+		return;
+	}
+	if ( function_exists( 'is_feed' ) && is_feed() ) {
+		return;
+	}
+	if ( apply_filters( 'wp_auto_webp_skip_output_buffer', false ) ) {
+		return;
+	}
+	ob_start( __NAMESPACE__ . '\rewrite_html_output' );
+}
+add_action( 'template_redirect', __NAMESPACE__ . '\maybe_start_html_rewriter', 0 );
+
+function rewrite_html_output( $html ) {
+	if ( ! is_string( $html ) || '' === $html ) {
+		return $html;
+	}
+	if ( false === stripos( $html, '<html' ) && false === stripos( $html, '<!doctype' ) ) {
+		return $html;
+	}
+
+	list( $base_url, $base_dir ) = uploads_base();
+	$host_path  = ltrim( strip_scheme( $base_url ), '/' ); // host + path, no scheme, no leading //
+	$host_quoted = preg_quote( $host_path, '/' );
+
+	// Match upload-base URLs to JPG/PNG/GIF, allowing four common slash encodings:
+	//   plain /        — typical HTML attributes
+	//   escaped \/     — JSON / JSON-LD blocks
+	//   entity &#47;   — over-cautious HTML escapers
+	//   unicode / — JSON encoders that escape forward slash to unicode
+	$slash = '(?:\\\\\/|\\\\u002F|&#47;|\/)';
+	$pattern = '#(?:https?:)?' . $slash . $slash . $host_quoted . $slash . '[^\s"\'<>()]+?\.(?:jpe?g|png|gif)(?=["\'\s<>?#)\\\\]|$)#i';
+
+	return preg_replace_callback(
+		$pattern,
+		function ( $m ) {
+			$url = $m[0];
+			// Normalize every slash variant to plain `/` so file lookup works.
+			$normalized = str_replace( array( '\\/', '\\u002F', '&#47;' ), '/', $url );
+			$new        = maybe_swap_to_webp_url( $normalized );
+			if ( $new === $normalized ) {
+				return $url;
+			}
+			// Re-encode the slashes the same way the original URL had them.
+			if ( false !== strpos( $url, '\\u002F' ) ) {
+				return str_replace( '/', '\\u002F', $new );
+			}
+			if ( false !== strpos( $url, '\\/' ) ) {
+				return str_replace( '/', '\\/', $new );
+			}
+			if ( false !== strpos( $url, '&#47;' ) ) {
+				return str_replace( '/', '&#47;', $new );
+			}
+			return $new;
+		},
+		$html
+	);
+}
+
+add_filter(
+	'wp_get_attachment_image_attributes',
+	function ( $attr ) {
+		if ( ! is_array( $attr ) ) {
+			return $attr;
+		}
+		if ( ! empty( $attr['src'] ) ) {
+			$attr['src'] = maybe_swap_to_webp_url( (string) $attr['src'] );
+		}
+		if ( ! empty( $attr['srcset'] ) ) {
+			$parts = preg_split( '/\s*,\s*/', (string) $attr['srcset'] );
+			$out   = array();
+			foreach ( $parts as $part ) {
+				$part = trim( $part );
+				if ( '' === $part ) {
+					continue;
+				}
+				$tokens     = preg_split( '/\s+/', $part, 2 );
+				$swapped    = maybe_swap_to_webp_url( $tokens[0] );
+				$descriptor = $tokens[1] ?? '';
+				$out[]      = $swapped . ( '' !== $descriptor ? ' ' . $descriptor : '' );
+			}
+			$attr['srcset'] = implode( ', ', $out );
+		}
+		return $attr;
+	},
+	10,
+	1
+);
 
 /**
  * WP-CLI: `wp auto-webp run --post=ID` (or --all) to (re)process posts on demand.
@@ -275,6 +514,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 					'skipped_external' => 0,
 				);
 				$new = process_content( $post->post_content, $stats );
+				ensure_featured_image_webp( $post->ID, $stats );
 				if ( $new !== $post->post_content ) {
 					global $wpdb;
 					$wpdb->update(
