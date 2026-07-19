@@ -24,7 +24,7 @@ That way every downstream consumer — Cloudflare, your CDN, AMP, RSS aggregator
 On every `save_post_post` (manual draft save, publish, scheduled, REST API, classic editor, block editor — anything that fires the hook), the plugin will:
 
 1. Read the saved post content and find every `<img>`-style URL pointing to a JPG / PNG / GIF inside `/wp-content/uploads`.
-2. Generate a sibling `.webp` next to each original (via `WP_Image_Editor`; Imagick preferred, GD fallback), quality 82.
+2. Generate a sibling `.webp` next to each original. Photos use WebP quality 95; PNG files use lossless WebP so text, UI graphics, and transparency remain pixel-accurate. Imagick is preferred, with the WordPress image editor as fallback.
 3. Rewrite `src`, `srcset`, `data-src`, `data-lazy-src`, and `data-srcset` attributes — plus Gutenberg block-comment `"url":"…"` metadata — to point at the `.webp` twin.
 4. Write the updated HTML straight back to the `wp_posts` table.
 5. Generate `.webp` sidecars for the **featured image** attachment original and every WP-generated thumbnail size.
@@ -35,7 +35,7 @@ Originals are never deleted. External URLs and non-raster files (SVG, JS, etc.) 
 ## What it does **not** do
 
 - Does not generate AVIF (the underlying libraries support it; a small fork away if you want it).
-- Does not bulk-process the entire media library — only files reached through post content or featured images.
+- Does not bulk-process the entire media library automatically. The opt-in `wp auto-webp regenerate` command can upgrade it in disk-safe batches.
 - Does not purge your CDN. If you sit behind Cloudflare / Bunny / Fastly, your edge cache will keep serving the old HTML until it expires. Wire your own purge into the `wp_auto_webp_post_types` flow if you need instant invalidation.
 
 ## Installation
@@ -111,6 +111,23 @@ Success: Done. posts_changed=12 converted=47 failed=0 skipped=8
 
 `skipped` counts external image URLs (URLs not under `/wp-content/uploads`). `failed` counts images the editor could not open — usually deleted source files or unreadable permissions.
 
+### Re-encoding existing WebP sidecars
+
+Version 1.2 fixes an Imagick ordering issue that could make the configured WebP quality ineffective. New and re-saved images automatically use the corrected encoder. Existing media can be upgraded explicitly:
+
+```bash
+# Re-encode one source image (path is relative to wp-content/uploads)
+wp auto-webp regenerate --file=2026/01/cover.jpg
+
+# Preview how many old sidecars remain
+wp auto-webp regenerate --all --dry-run
+
+# Upgrade in repeatable batches; already-upgraded files are skipped on the next run
+wp auto-webp regenerate --all --limit=1000
+```
+
+The command writes to a temporary file and atomically replaces the public `.webp` only after a successful encode. A 5 GiB free-space guard stops bulk work before the uploads disk becomes dangerously full.
+
 ## Extending
 
 ### Process additional post types
@@ -121,6 +138,18 @@ add_filter( 'wp_auto_webp_post_types', function ( $types ) {
     $types[] = 'product';
     return $types;
 } );
+```
+
+### Adjust photo quality or PNG lossless mode
+
+```php
+add_filter( 'wp_auto_webp_quality', function ( $quality, $source_path, $mime ) {
+    return 95; // 1-100; used for lossy images.
+}, 10, 3 );
+
+add_filter( 'wp_auto_webp_lossless', function ( $lossless, $source_path, $mime ) {
+    return $lossless; // Defaults to true for PNG and false for JPEG.
+}, 10, 3 );
 ```
 
 ### Read what happened on the last save
@@ -139,8 +168,9 @@ $stats = get_post_meta( $post_id, '_wp_auto_webp_stats', true );
 ## How it works (under the hood)
 
 - **Hook:** `save_post_post` at priority 20. Autosaves, revisions, `auto-draft`, `trash`, and `inherit` statuses are rejected up front so the heavy work never runs for noise saves.
-- **Encoder:** `wp_get_image_editor( $path )` — Imagick is picked first; GD is the fallback. Both are saved with `image/webp` MIME and a quality of 82, which empirically gives near-visually-lossless output at roughly 30–80% file size savings vs JPG/PNG.
-- **Idempotency:** Before re-encoding, the plugin checks `filemtime( webp ) >= filemtime( source )`. If a fresher `.webp` already exists (e.g., from a previous plugin), it is reused — no wasted CPU.
+- **Encoder:** With Imagick, the output format is switched to WebP *before* WebP options are applied. JPEG uses quality 95 and method 6. PNG uses lossless mode with alpha quality 100. ICC colour profiles are retained while EXIF and other non-rendering metadata are removed. The WordPress image editor remains the compatibility fallback.
+- **Safe writes:** Encoding happens in a same-directory temporary file. The public sidecar is atomically replaced only after a complete, non-empty WebP has been produced.
+- **Idempotency:** The plugin compares source/sidecar timestamps and the encoder release timestamp. Current sidecars are reused; older v1.0/v1.1 sidecars are upgraded the next time that source is reached or through `wp auto-webp regenerate`.
 - **DB writes:** Content updates go through `$wpdb->update` directly, not `wp_update_post`. This is deliberate: we only rewrite URL substrings inside attributes we found, never inject new HTML, so we skip `wp_kses` re-sanitization and we don't re-enter the `save_post` action.
 - **Block editor compatibility:** Gutenberg stores image URLs both in the inner `<img src>` *and* in the block-comment JSON header (`<!-- wp:image {"url":"…"} -->`). Both are rewritten in lockstep, so the editor will not flag a "block recovery" mismatch on reopen.
 
@@ -162,9 +192,18 @@ You can, and it's a fine approach. But rewriting `src` directly is simpler, play
 The newest one wins per `filemtime` check — usually that's whichever plugin ran most recently. There is only ever one `.webp` per source.
 
 **Can I change the quality?**
-Open `wp-auto-webp-converter-plugin.php` and tweak the `QUALITY` constant. It's the only knob right now and intentionally so.
+Yes. Use the `wp_auto_webp_quality` filter; the default is 95. PNG is lossless by default and can be changed with `wp_auto_webp_lossless`.
 
 ## Changelog
+
+### 1.2.0
+- Fixes the Imagick format/quality ordering bug that could make the configured WebP quality ineffective.
+- Raises lossy photo quality to 95 and encodes PNG as lossless WebP by default.
+- Preserves ICC colour profiles while removing non-rendering metadata.
+- Uses atomic temporary-file writes so a failed encode cannot replace a working public image.
+- Automatically upgrades old sidecars when their source is reached.
+- Adds `wp auto-webp regenerate --file=...` and disk-safe, repeatable `--all --limit=...` batches, plus `--dry-run`.
+- Adds `wp_auto_webp_quality`, `wp_auto_webp_lossless`, and `wp_auto_webp_min_free_disk_bytes` filters.
 
 ### 1.1.0
 - **Featured image + everything-else coverage.** On save, `.webp` sidecars are generated for the featured image attachment and every WordPress-generated thumbnail size. At render time URLs are swapped to `.webp` via a stack of complementary filters:

@@ -2,8 +2,8 @@
 /**
  * Plugin Name: WP Auto WebP Converter
  * Plugin URI: https://github.com/burakgon/wp-auto-webp-converter-plugin
- * Description: On every post save, scans the post content for &lt;img&gt; references to JPG/PNG/GIF files under /wp-content/uploads, generates a sibling .webp via WP_Image_Editor (Imagick preferred, GD fallback), and rewrites src / srcset / data-src / data-lazy-src / data-srcset attributes to point at the .webp version. Featured images (and every WordPress-generated thumbnail size for them) are also converted and swapped to .webp at render time via the wp_get_attachment_image_src and wp_calculate_image_srcset filters — covering featured image displays, galleries, OG tags, schema.org, and REST API output. Originals stay on disk as fallback. Idempotent: a second save is a no-op when every URL is already .webp or already converted.
- * Version: 1.1.0
+ * Description: Converts upload images to WebP on post save, using high-quality photo encoding and lossless PNG conversion. Rewrites image URLs in post content and swaps featured-image, gallery, Open Graph, schema.org, and REST API URLs while retaining originals as fallback.
+ * Version: 1.2.0
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Author: burakgon
@@ -18,12 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const VERSION    = '1.1.0';
-const QUALITY    = 82;
-const META_RUN   = '_wp_auto_webp_last_run';
-const META_STATS = '_wp_auto_webp_stats';
-const LOG_PREFIX = '[wp-auto-webp] ';
-const HOOK_PRIO  = 20;
+const VERSION             = '1.2.0';
+const LOSSY_QUALITY       = 95;
+const ENCODER_MTIME       = 1784460357;
+const MIN_FREE_DISK_BYTES = 5368709120;
+const META_RUN            = '_wp_auto_webp_last_run';
+const META_STATS          = '_wp_auto_webp_stats';
+const LOG_PREFIX          = '[wp-auto-webp] ';
+const HOOK_PRIO           = 20;
 
 /**
  * Default post types we touch. Override with the wp_auto_webp_post_types filter.
@@ -89,31 +91,152 @@ function url_to_webp_url( string $src_url ): string {
 }
 
 /**
- * Generate a .webp sibling for the source if missing or outdated.
+ * Return the source MIME without trusting file extensions alone.
+ */
+function source_mime_type( string $src_path ): string {
+	$mime = function_exists( 'wp_get_image_mime' ) ? wp_get_image_mime( $src_path ) : false;
+	if ( ! $mime ) {
+		$info = @getimagesize( $src_path );
+		$mime = is_array( $info ) && ! empty( $info['mime'] ) ? $info['mime'] : '';
+	}
+	return strtolower( (string) $mime );
+}
+
+/**
+ * Existing sidecars made before the v1.2 encoder must be replaced once reached.
+ */
+function webp_needs_regeneration( string $src_path, string $webp_path ): bool {
+	if ( ! is_file( $webp_path ) ) {
+		return true;
+	}
+	$src_mtime  = filemtime( $src_path );
+	$webp_mtime = filemtime( $webp_path );
+	return false === $src_mtime || false === $webp_mtime || $webp_mtime < $src_mtime || $webp_mtime < ENCODER_MTIME;
+}
+
+/**
+ * Encode with Imagick after switching the output format to WebP. WordPress' Imagick
+ * editor applies quality while its MIME is still the source format, so that setting
+ * can be lost during the later WebP format switch.
+ *
+ * PNG defaults to lossless. For photos, quality 95 retains fine detail while still
+ * providing a substantial size reduction. ICC colour data is retained; EXIF and
+ * other non-rendering metadata are removed after orientation is applied.
+ *
+ * @return true|\WP_Error
+ */
+function encode_with_imagick( string $src_path, string $dest_path, string $mime ) {
+	if ( ! class_exists( '\\Imagick' ) || 'image/gif' === $mime ) {
+		return new \WP_Error( 'imagick_unavailable', 'Direct Imagick WebP encoding is unavailable for this image.' );
+	}
+
+	try {
+		$image = new \Imagick( $src_path );
+		if ( $image->getNumberImages() > 1 ) {
+			$image->clear();
+			$image->destroy();
+			return new \WP_Error( 'animated_image', 'Animated images use the WordPress editor fallback.' );
+		}
+
+		if ( method_exists( $image, 'autoOrient' ) ) {
+			$image->autoOrient();
+		} elseif ( method_exists( $image, 'autoOrientImage' ) ) {
+			$image->autoOrientImage();
+		}
+
+		$icc_profiles = $image->getImageProfiles( 'icc', true );
+		$image->stripImage();
+		foreach ( $icc_profiles as $name => $profile ) {
+			$image->profileImage( $name, $profile );
+		}
+
+		$lossless = (bool) apply_filters( 'wp_auto_webp_lossless', 'image/png' === $mime, $src_path, $mime );
+		$quality  = (int) apply_filters( 'wp_auto_webp_quality', LOSSY_QUALITY, $src_path, $mime );
+		$quality  = max( 1, min( 100, $quality ) );
+
+		// The order is intentional: choose WebP before applying WebP-specific options.
+		$image->setImageFormat( 'webp' );
+		$image->setOption( 'webp:method', '6' );
+		if ( $lossless ) {
+			$image->setOption( 'webp:lossless', 'true' );
+			$image->setOption( 'webp:alpha-quality', '100' );
+			$image->setImageCompressionQuality( 100 );
+		} else {
+			$image->setOption( 'webp:lossless', 'false' );
+			$image->setImageCompressionQuality( $quality );
+		}
+
+		$written = $image->writeImage( $dest_path );
+		$image->clear();
+		$image->destroy();
+		if ( ! $written || ! is_file( $dest_path ) || 0 === filesize( $dest_path ) ) {
+			return new \WP_Error( 'imagick_write_failed', 'Imagick did not produce a valid WebP file.' );
+		}
+		return true;
+	} catch ( \Throwable $e ) {
+		return new \WP_Error( 'imagick_exception', $e->getMessage() );
+	}
+}
+
+/**
+ * WordPress/GD fallback for hosts without a compatible Imagick extension.
+ *
+ * @return true|\WP_Error
+ */
+function encode_with_wordpress_editor( string $src_path, string $dest_path ) {
+	$editor = wp_get_image_editor( $src_path );
+	if ( is_wp_error( $editor ) ) {
+		return $editor;
+	}
+	$quality = (int) apply_filters( 'wp_auto_webp_quality', LOSSY_QUALITY, $src_path, source_mime_type( $src_path ) );
+	$editor->set_quality( max( 1, min( 100, $quality ) ) );
+	$saved = $editor->save( $dest_path, 'image/webp' );
+	return is_wp_error( $saved ) ? $saved : true;
+}
+
+/**
+ * Generate a .webp sibling for the source if missing, outdated, or made by the
+ * previous encoder. Writes to a same-directory temporary file and atomically
+ * replaces the public sidecar only after a complete encode.
  * Returns true if the .webp now exists and is current.
  */
-function ensure_webp( string $src_path ): bool {
+function ensure_webp( string $src_path, bool $force = false ): bool {
 	$webp_path = path_to_webp_path( $src_path );
 	if ( $webp_path === $src_path ) {
 		// Already a .webp on disk (defensive).
 		return true;
 	}
-	if ( is_file( $webp_path ) && filemtime( $webp_path ) >= filemtime( $src_path ) ) {
+	if ( ! $force && ! webp_needs_regeneration( $src_path, $webp_path ) ) {
 		return true;
 	}
 
-	$editor = wp_get_image_editor( $src_path );
-	if ( is_wp_error( $editor ) ) {
-		error_log( LOG_PREFIX . 'open failed: ' . $src_path . ' — ' . $editor->get_error_message() );
+	$mime = source_mime_type( $src_path );
+	if ( ! in_array( $mime, array( 'image/jpeg', 'image/png', 'image/gif' ), true ) ) {
+		error_log( LOG_PREFIX . 'unsupported image: ' . $src_path . ' (' . $mime . ')' );
 		return false;
 	}
-	$editor->set_quality( QUALITY );
-	$saved = $editor->save( $webp_path, 'image/webp' );
-	if ( is_wp_error( $saved ) ) {
-		error_log( LOG_PREFIX . 'save failed: ' . $src_path . ' — ' . $saved->get_error_message() );
+
+	$temp_path = $webp_path . '.tmp-' . wp_generate_uuid4() . '.webp';
+	$result    = encode_with_imagick( $src_path, $temp_path, $mime );
+	if ( is_wp_error( $result ) ) {
+		$result = encode_with_wordpress_editor( $src_path, $temp_path );
+	}
+	if ( is_wp_error( $result ) || ! is_file( $temp_path ) ) {
+		if ( is_file( $temp_path ) ) {
+			unlink( $temp_path );
+		}
+		$message = is_wp_error( $result ) ? $result->get_error_message() : 'encoder produced no output';
+		error_log( LOG_PREFIX . 'save failed: ' . $src_path . ' — ' . $message );
 		return false;
 	}
-	return is_file( $webp_path );
+
+	if ( ! rename( $temp_path, $webp_path ) ) {
+		unlink( $temp_path );
+		error_log( LOG_PREFIX . 'atomic replace failed: ' . $webp_path );
+		return false;
+	}
+	chmod( $webp_path, 0664 & ~umask() );
+	return is_file( $webp_path ) && 0 < filesize( $webp_path );
 }
 
 /**
@@ -487,6 +610,40 @@ add_filter(
 );
 
 /**
+ * Resolve a CLI file argument and guarantee that it remains inside uploads.
+ * Accepts either an absolute path or a path relative to the uploads directory.
+ *
+ * @return string|\WP_Error
+ */
+function resolve_upload_source_path( string $input ) {
+	list( , $base_dir ) = uploads_base();
+	$base_real = realpath( $base_dir );
+	if ( false === $base_real ) {
+		return new \WP_Error( 'uploads_missing', 'The uploads directory could not be resolved.' );
+	}
+
+	$candidate = ( 0 === strpos( $input, DIRECTORY_SEPARATOR ) ) ? $input : $base_real . DIRECTORY_SEPARATOR . ltrim( $input, '/\\' );
+	$real      = realpath( $candidate );
+	if ( false === $real || ! is_file( $real ) ) {
+		return new \WP_Error( 'source_missing', 'Source image not found: ' . $input );
+	}
+	if ( 0 !== strpos( $real, $base_real . DIRECTORY_SEPARATOR ) ) {
+		return new \WP_Error( 'outside_uploads', 'Source image must be inside the WordPress uploads directory.' );
+	}
+	if ( ! preg_match( '/\.(jpe?g|png|gif)$/i', $real ) ) {
+		return new \WP_Error( 'unsupported_extension', 'Source must be a JPG, PNG, or GIF image.' );
+	}
+	return $real;
+}
+
+function encoder_has_disk_headroom(): bool {
+	list( , $base_dir ) = uploads_base();
+	$minimum = (int) apply_filters( 'wp_auto_webp_min_free_disk_bytes', MIN_FREE_DISK_BYTES );
+	$free    = disk_free_space( $base_dir );
+	return false === $free || $free >= $minimum;
+}
+
+/**
  * WP-CLI: `wp auto-webp run --post=ID` (or --all) to (re)process posts on demand.
  */
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -587,6 +744,123 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 					'type'        => 'flag',
 					'optional'    => true,
 					'description' => 'Process every post matching wp_auto_webp_post_types.',
+				),
+			),
+		)
+	);
+
+	\WP_CLI::add_command(
+		'auto-webp regenerate',
+		function ( $args, $assoc ) {
+			$has_file = ! empty( $assoc['file'] );
+			$has_all  = ! empty( $assoc['all'] );
+			if ( $has_file === $has_all ) {
+				\WP_CLI::error( 'Use exactly one of --file=<uploads-relative-path> or --all.' );
+			}
+			if ( ! encoder_has_disk_headroom() ) {
+				\WP_CLI::error( 'Regeneration stopped because less than 5 GiB remains on the uploads volume.' );
+			}
+
+			if ( $has_file ) {
+				$source = resolve_upload_source_path( (string) $assoc['file'] );
+				if ( is_wp_error( $source ) ) {
+					\WP_CLI::error( $source->get_error_message() );
+				}
+				$webp_path  = path_to_webp_path( $source );
+				$before     = is_file( $webp_path ) ? filesize( $webp_path ) : 0;
+				$source_size = filesize( $source );
+				if ( ! ensure_webp( $source, true ) ) {
+					\WP_CLI::error( 'Encoding failed; the existing public sidecar was left untouched.' );
+				}
+				\WP_CLI::success(
+					sprintf(
+						'Regenerated %s (source=%d bytes, previous=%d bytes, new=%d bytes).',
+						str_replace( wp_normalize_path( wp_get_upload_dir()['basedir'] ) . '/', '', wp_normalize_path( $source ) ),
+						$source_size,
+						$before,
+						filesize( $webp_path )
+					)
+				);
+				return;
+			}
+
+			$limit   = isset( $assoc['limit'] ) ? max( 0, (int) $assoc['limit'] ) : 0;
+			$dry_run = ! empty( $assoc['dry-run'] );
+			list( , $base_dir ) = uploads_base();
+			$iterator = new \RecursiveIteratorIterator(
+				new \RecursiveDirectoryIterator( $base_dir, \FilesystemIterator::SKIP_DOTS )
+			);
+			$updated = 0;
+			$failed  = 0;
+			$current = 0;
+			$pending = 0;
+
+			foreach ( $iterator as $file ) {
+				if ( ! $file->isFile() || ! preg_match( '/\.(jpe?g|png|gif)$/i', $file->getFilename() ) ) {
+					continue;
+				}
+				$source    = $file->getPathname();
+				$webp_path = path_to_webp_path( $source );
+				if ( ! webp_needs_regeneration( $source, $webp_path ) ) {
+					++$current;
+					continue;
+				}
+				++$pending;
+				if ( $dry_run ) {
+					if ( $limit && $pending >= $limit ) {
+						break;
+					}
+					continue;
+				}
+				if ( ! encoder_has_disk_headroom() ) {
+					\WP_CLI::warning( 'Stopped with less than 5 GiB free; rerun after freeing space.' );
+					break;
+				}
+				if ( ensure_webp( $source ) ) {
+					++$updated;
+				} else {
+					++$failed;
+				}
+				if ( 0 === ( ( $updated + $failed ) % 100 ) ) {
+					\WP_CLI::log( sprintf( 'Progress: updated=%d failed=%d current=%d', $updated, $failed, $current ) );
+				}
+				if ( $limit && ( $updated + $failed ) >= $limit ) {
+					break;
+				}
+			}
+
+			if ( $dry_run ) {
+				\WP_CLI::success( sprintf( 'Dry run: pending=%d current=%d%s.', $pending, $current, $limit ? ' (limited scan)' : '' ) );
+				return;
+			}
+			\WP_CLI::success( sprintf( 'Regeneration finished: updated=%d failed=%d current=%d.', $updated, $failed, $current ) );
+		},
+		array(
+			'shortdesc' => 'Re-encode upload sidecars with the current quality settings.',
+			'synopsis'  => array(
+				array(
+					'name'        => 'file',
+					'type'        => 'assoc',
+					'optional'    => true,
+					'description' => 'One source image path, absolute or relative to uploads.',
+				),
+				array(
+					'name'        => 'all',
+					'type'        => 'flag',
+					'optional'    => true,
+					'description' => 'Scan uploads and upgrade sidecars made by an older encoder.',
+				),
+				array(
+					'name'        => 'limit',
+					'type'        => 'assoc',
+					'optional'    => true,
+					'description' => 'Maximum number of pending files to process in this batch (0 = unlimited).',
+				),
+				array(
+					'name'        => 'dry-run',
+					'type'        => 'flag',
+					'optional'    => true,
+					'description' => 'Count pending upgrades without writing files.',
 				),
 			),
 		)
