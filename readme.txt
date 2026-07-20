@@ -4,7 +4,7 @@ Tags: webp, images, performance, optimization
 Requires at least: 5.8
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.2.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -33,6 +33,10 @@ The post-content DB update bypasses `wp_update_post` and `kses`; we only rewrite
     wp auto-webp regenerate --all --limit=1000
 
 == Changelog ==
+
+= 1.2.1 =
+* Rejects lookalike hosts and sibling paths when mapping upload URLs to local files.
+* Adds automated URL-boundary regression tests across supported PHP versions.
 
 = 1.2.0 =
 * Fixes the Imagick format/quality ordering bug that could make configured WebP quality ineffective.

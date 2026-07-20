@@ -3,7 +3,7 @@
  * Plugin Name: WP Auto WebP Converter
  * Plugin URI: https://github.com/burakgon/wp-auto-webp-converter-plugin
  * Description: Converts upload images to WebP on post save, using high-quality photo encoding and lossless PNG conversion. Rewrites image URLs in post content and swaps featured-image, gallery, Open Graph, schema.org, and REST API URLs while retaining originals as fallback.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Author: burakgon
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const VERSION             = '1.2.0';
+const VERSION             = '1.2.1';
 const LOSSY_QUALITY       = 95;
 const ENCODER_MTIME       = 1784460357;
 const MIN_FREE_DISK_BYTES = 5368709120;
@@ -65,7 +65,10 @@ function strip_scheme( string $url ): string {
 function url_to_local_path( string $url, string $base_url, string $base_dir ): ?string {
 	$normalized      = strip_scheme( $url );
 	$normalized_base = strip_scheme( $base_url );
-	if ( strpos( $normalized, $normalized_base ) !== 0 ) {
+	// Require a path-segment boundary after the uploads base. A plain prefix
+	// check also accepts different hosts (example.com.evil) and sibling paths
+	// (uploads-archive) as if they belonged to this WordPress installation.
+	if ( strpos( $normalized, $normalized_base . '/' ) !== 0 ) {
 		return null;
 	}
 	$rel = ltrim( substr( $normalized, strlen( $normalized_base ) ), '/' );
