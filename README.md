@@ -196,6 +196,10 @@ Yes. Use the `wp_auto_webp_quality` filter; the default is 95. PNG is lossless b
 
 ## Changelog
 
+### 1.2.1
+- Rejects lookalike hosts such as `example.com.evil` and sibling paths such as `uploads-archive` when mapping upload URLs to local files.
+- Adds automated URL-boundary regression tests across supported PHP versions.
+
 ### 1.2.0
 - Fixes the Imagick format/quality ordering bug that could make the configured WebP quality ineffective.
 - Raises lossy photo quality to 95 and encodes PNG as lossless WebP by default.
